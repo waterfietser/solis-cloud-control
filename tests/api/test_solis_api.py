@@ -1,11 +1,15 @@
+import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, cast
+from unittest.mock import DEFAULT, AsyncMock, patch
 
 import pytest
-from aiohttp import ClientSession, web
+from aiohttp import ClientConnectionError, ClientSession, web
 from aiohttp.test_utils import TestClient
 
 from custom_components.solis_cloud_control.api.solis_api import SolisCloudControlApiClient, SolisCloudControlApiError
+from custom_components.solis_cloud_control.utils.retry_policy import RetryPolicy
 
 if TYPE_CHECKING:
     from pytest_aiohttp.plugin import AiohttpClient
@@ -93,9 +97,7 @@ async def test_control(create_api_client: ApiClientFactory, aiohttp_client: Aioh
     client = await aiohttp_client(app)
     api_client = create_api_client(client)
 
-    await api_client.control(
-        inverter_sn=any_inverter_sn, cid=any_cid, value=any_value, old_value=any_old_value, max_retry_time=0
-    )
+    await api_client.control(inverter_sn=any_inverter_sn, cid=any_cid, value=any_value, old_value=any_old_value)
 
 
 async def test_inverter_list(create_api_client: ApiClientFactory, aiohttp_client: AiohttpClient) -> None:
@@ -190,6 +192,149 @@ async def test_read_errors(
         await api_client.read(inverter_sn="any inverter", cid=-1, max_retry_time=0)
 
     assert str(excinfo.value) == str(expected_error)
+
+
+@pytest.mark.parametrize(("status", "code"), [(200, "B0072"), (200, "Z0001"), (401, None), (400, None)])
+async def test_read_does_not_retry_expected_or_permanent_errors(
+    create_api_client: ApiClientFactory,
+    aiohttp_client: AiohttpClient,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+    code: str | None,
+) -> None:
+    requests = 0
+
+    async def endpoint(_request: web.Request) -> web.Response:
+        nonlocal requests
+        requests += 1
+        return web.json_response({"code": code, "msg": "API error"}, status=status)
+
+    app = web.Application()
+    app.router.add_post(SolisCloudControlApiClient._READ_ENDPOINT, endpoint)
+    api_client = create_api_client(await aiohttp_client(app))
+
+    with pytest.raises(SolisCloudControlApiError):
+        await api_client.read("sn", 15)
+
+    assert requests == 1
+    assert not any(record.levelno >= logging.WARNING and "Retrying" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_after", "expected_delay"),
+    [
+        (429, "4", 4),
+        (429, None, 30),
+        (429, "invalid", 30),
+        (429, "Sat, 21 Nov 2020 14:00:00 GMT", 1),
+        (429, "Sat, 21 Nov 2020 14:00:00", 1),
+        (429, "9" * 400, 30),
+        (429, "120", None),
+        (503, None, 1),
+    ],
+)
+async def test_read_backoff(
+    create_api_client: ApiClientFactory,
+    aiohttp_client: AiohttpClient,
+    status: int,
+    retry_after: str | None,
+    expected_delay: float | None,
+) -> None:
+    requests = 0
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def endpoint(_request: web.Request) -> web.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            headers = {"Retry-After": retry_after} if retry_after is not None else None
+            return web.Response(status=status, headers=headers, text="Temporarily unavailable")
+        return web.json_response({"code": "0", "data": {"msg": "55"}})
+
+    app = web.Application()
+    app.router.add_post(SolisCloudControlApiClient._READ_ENDPOINT, endpoint)
+    api_client = create_api_client(await aiohttp_client(app))
+    retry_policy = RetryPolicy(retryable_exception=SolisCloudControlApiError, sleep=sleep)
+
+    with patch.object(api_client, "_retry_policy", retry_policy):
+        if expected_delay is None:
+            with pytest.raises(SolisCloudControlApiError) as error:
+                await api_client.read("sn", 15)
+            assert error.value.retry_after == 120
+            assert requests == 1
+            assert delays == []
+        else:
+            assert await api_client.read("sn", 15) == "55"
+            assert requests == 2
+            assert delays == [expected_delay]
+
+
+async def test_read_deadline_cancels_request(
+    create_api_client: ApiClientFactory, aiohttp_client: AiohttpClient
+) -> None:
+    cancelled = asyncio.Event()
+
+    async def slow_request(*_args: object) -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    api_client = create_api_client(await aiohttp_client(web.Application()))
+    with (
+        patch.object(api_client, "_execute_request", side_effect=slow_request),
+        pytest.raises(SolisCloudControlApiError, match="retry deadline"),
+    ):
+        await api_client.read("sn", 15, max_retry_time=0.01)
+    assert cancelled.is_set()
+
+
+@pytest.mark.parametrize("request_error", [TimeoutError(), ClientConnectionError("Disconnected")])
+async def test_read_retries_a_temporary_request_failure(
+    create_api_client: ApiClientFactory, aiohttp_client: AiohttpClient, request_error: Exception
+) -> None:
+    async def endpoint(_request: web.Request) -> web.Response:
+        return web.json_response({"code": "0", "data": {"msg": "55"}})
+
+    app = web.Application()
+    app.router.add_post(SolisCloudControlApiClient._READ_ENDPOINT, endpoint)
+    client = await aiohttp_client(app)
+    api_client = create_api_client(client)
+    sleep = AsyncMock()
+    retry_policy = RetryPolicy(retryable_exception=SolisCloudControlApiError, sleep=sleep)
+
+    with (
+        patch.object(api_client, "_retry_policy", retry_policy),
+        patch.object(client, "post", wraps=client.post, side_effect=[request_error, DEFAULT]) as post,
+    ):
+        assert await api_client.read("sn", 15) == "55"
+    assert post.call_count == 2
+    sleep.assert_awaited_once_with(1)
+
+
+@pytest.mark.parametrize("status", [200, 500])
+async def test_control_sends_a_failed_command_only_once(
+    create_api_client: ApiClientFactory, aiohttp_client: AiohttpClient, status: int
+) -> None:
+    requests = 0
+
+    async def endpoint(_request: web.Request) -> web.Response:
+        nonlocal requests
+        requests += 1
+        return web.json_response(
+            {"code": "0", "data": [{"code": "B0072", "msg": "The device is offline"}]}, status=status
+        )
+
+    app = web.Application()
+    app.router.add_post(SolisCloudControlApiClient._CONTROL_ENDPOINT, endpoint)
+    api_client = create_api_client(await aiohttp_client(app))
+    with pytest.raises(SolisCloudControlApiError) as error:
+        await api_client.control("sn", 15, "0")
+    assert error.value.is_offline == (status == 200)
+    assert requests == 1
 
 
 async def mock_read_batch_endpoint_http_error(request: web.Request) -> web.Response:
@@ -323,7 +468,7 @@ async def test_control_errors(
     api_client = create_api_client(client)
 
     with pytest.raises(SolisCloudControlApiError) as excinfo:
-        await api_client.control(inverter_sn="any inverter", cid=-1, value="any value", max_retry_time=0)
+        await api_client.control(inverter_sn="any inverter", cid=-1, value="any value")
 
     assert str(excinfo.value) == str(expected_error)
 

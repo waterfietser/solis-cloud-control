@@ -1,14 +1,17 @@
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from homeassistant.const import CONF_API_KEY, CONF_API_TOKEN, Platform
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util.hass_dict import HassEntryKey
 
 from custom_components.solis_cloud_control.api.solis_api import SolisCloudControlApiClient, SolisCloudControlApiError
-from custom_components.solis_cloud_control.const import API_BASE_URL, CONF_INVERTER_SN
+from custom_components.solis_cloud_control.const import API_BASE_URL, CONF_INVERTER_SN, DOMAIN
 from custom_components.solis_cloud_control.coordinator import SolisCloudControlCoordinator
 from custom_components.solis_cloud_control.data import SolisCloudControlConfigEntry, SolisCloudControlData
 from custom_components.solis_cloud_control.inverters.inverter_factory import create_inverter, create_inverter_info
@@ -18,6 +21,8 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+_SETUP_TIMEOUT_SECONDS = 10
+_SETUP_RATE_LIMITS = HassEntryKey[float](f"{DOMAIN}.setup_rate_limits")
 _PLATFORMS: list[Platform] = [
     Platform.DATETIME,
     Platform.NUMBER,
@@ -32,16 +37,34 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: SolisCloudControl
     api_key = config_entry.data[CONF_API_KEY]
     api_token = config_entry.data[CONF_API_TOKEN]
     inverter_sn = config_entry.data[CONF_INVERTER_SN]
+    rate_limits = hass.data.setdefault(_SETUP_RATE_LIMITS, {})
+    if rate_limits.get(config_entry.entry_id, 0) > hass.loop.time():
+        raise ConfigEntryNotReady("Waiting for the SolisCloud API rate limit to reset")
+    rate_limits.pop(config_entry.entry_id, None)
 
     # create api client
     api_client = _create_api_client(hass, api_key, api_token)
 
-    # create inverter
     try:
-        inverter_info = await create_inverter_info(api_client, inverter_sn)
+        async with asyncio.timeout(_SETUP_TIMEOUT_SECONDS):
+            inverter_info = await create_inverter_info(api_client, inverter_sn)
+            inverter = create_inverter(inverter_info)
+            coordinator = SolisCloudControlCoordinator(hass, config_entry, api_client, inverter)
+            await coordinator.async_config_entry_first_refresh()
+    except TimeoutError as error:
+        raise ConfigEntryNotReady("Timed out reading inverter capabilities or settings from SolisCloud") from error
+    except ConfigEntryNotReady as error:
+        if isinstance(update_error := error.__cause__, UpdateFailed) and update_error.retry_after is not None:
+            rate_limits[config_entry.entry_id] = hass.loop.time() + update_error.retry_after
+        raise
     except SolisCloudControlApiError as error:
+        if error.is_auth_error:
+            raise ConfigEntryAuthFailed(f"Check the SolisCloud API key and token: {error}") from error
+        if error.is_configuration_error:
+            raise ConfigEntryError(f"Check the inverter and SolisCloud API configuration: {error}") from error
+        if (retry_after := error.rate_limit_delay) is not None:
+            rate_limits[config_entry.entry_id] = hass.loop.time() + retry_after
         raise ConfigEntryNotReady(f"Unable to read inverter info for '{inverter_sn}': {error}") from error
-    inverter = create_inverter(inverter_info)
 
     # register the inverter in the device registry
     device_registry = dr.async_get(hass)
@@ -56,12 +79,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: SolisCloudControl
         sw_version=inverter_info.version or "Unknown",
     )
 
-    # create coordinator
-    coordinator = SolisCloudControlCoordinator(hass, config_entry, api_client, inverter)
-
-    # perform an initial data load from api
-    await coordinator.async_config_entry_first_refresh()
-
     # make coordinator available to integration
     config_entry.runtime_data = SolisCloudControlData(inverter, coordinator)
 
@@ -73,6 +90,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: SolisCloudControl
 
 async def async_unload_entry(hass: HomeAssistant, config_entry: SolisCloudControlConfigEntry) -> bool:
     return await hass.config_entries.async_unload_platforms(config_entry, _PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, config_entry: SolisCloudControlConfigEntry) -> None:
+    hass.data.setdefault(_SETUP_RATE_LIMITS, {}).pop(config_entry.entry_id, None)
 
 
 async def async_migrate_entry(hass: HomeAssistant, config_entry: SolisCloudControlConfigEntry) -> bool:

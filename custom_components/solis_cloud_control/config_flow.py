@@ -45,7 +45,7 @@ class SolisCloudControlFlowHandler(ConfigFlow, domain=DOMAIN):
 
             except SolisCloudControlApiError as error:
                 _LOGGER.warning(error, exc_info=True)
-                if error.response_code == "Z0001":
+                if error.is_auth_error:
                     errors["base"] = "invalid_auth"
                 else:
                     errors["base"] = "cannot_connect"

@@ -1,6 +1,7 @@
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from custom_components.solis_cloud_control.api.solis_api import SolisCloudControlApiError
 from custom_components.solis_cloud_control.inverters.inverter import (
     Inverter,
     InverterAllowExport,
@@ -32,18 +33,19 @@ from custom_components.solis_cloud_control.inverters.inverter import (
 if TYPE_CHECKING:
     from custom_components.solis_cloud_control.api.solis_api import SolisCloudControlApiClient
 
-_MAX_RETRY_TIME_SECONDS = 60
-
 
 async def create_inverter_info(api_client: SolisCloudControlApiClient, inverter_sn: str) -> InverterInfo:
-    inverter_details = await api_client.inverter_details(inverter_sn, _MAX_RETRY_TIME_SECONDS)
+    inverter_details = await api_client.inverter_details(inverter_sn, max_retry_time=0)
+    energy_storage_control = _get_inverter_detail(inverter_details, "energyStorageControl")
+    if not energy_storage_control:
+        raise SolisCloudControlApiError("Inverter details are missing 'energyStorageControl'")
 
     inverter_info = InverterInfo(
         serial_number=inverter_sn,
         model=_get_inverter_detail(inverter_details, "model"),
         version=_get_inverter_detail(inverter_details, "version"),
         machine=_get_inverter_detail(inverter_details, "machine"),
-        energy_storage_control=_get_inverter_detail(inverter_details, "energyStorageControl"),
+        energy_storage_control=energy_storage_control,
         smart_support=_get_inverter_detail(inverter_details, "smartSupport"),
         generator_support=_get_inverter_detail(inverter_details, "generatorSupport"),
         collector_model=_get_inverter_detail(inverter_details, "collectorModel"),
@@ -55,7 +57,9 @@ async def create_inverter_info(api_client: SolisCloudControlApiClient, inverter_
     )
 
     if not inverter_info.is_string_inverter:
-        tou_v2_mode = await api_client.read(inverter_sn, 6798, _MAX_RETRY_TIME_SECONDS)
+        tou_v2_mode = await api_client.read(inverter_sn, 6798, max_retry_time=0)
+        if tou_v2_mode is None:
+            raise SolisCloudControlApiError("Unable to determine the inverter TOU mode")
         inverter_info = replace(inverter_info, tou_v2_mode=tou_v2_mode)
 
     return inverter_info

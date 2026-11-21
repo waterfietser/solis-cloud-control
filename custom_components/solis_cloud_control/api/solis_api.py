@@ -1,7 +1,10 @@
 import asyncio
 import json
 import logging
-from typing import Any
+import math
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
@@ -13,6 +16,9 @@ from custom_components.solis_cloud_control.api.solis_api_utils import (
 )
 from custom_components.solis_cloud_control.utils.retry_policy import RetryPolicy
 
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -22,9 +28,14 @@ class SolisCloudControlApiError(Exception):
         message: str,
         status_code: int | None = None,
         response_code: str | None = None,
+        *,
+        retry_after: float | None = None,
+        connection_error: bool = False,
     ) -> None:
         self.status_code = status_code
         self.response_code = response_code
+        self.retry_after = retry_after
+        self.connection_error = connection_error
         final_message = message
         if status_code is not None:
             final_message = f"{final_message} (HTTP status code: {status_code})"
@@ -32,6 +43,48 @@ class SolisCloudControlApiError(Exception):
             final_message = f"{final_message} (API response code: {response_code})"
 
         super().__init__(final_message)
+
+    @property
+    def is_offline(self) -> bool:
+        return self.response_code == "B0072"
+
+    @property
+    def is_auth_error(self) -> bool:
+        return self.response_code == "Z0001" or self.status_code in (401, 403)
+
+    @property
+    def is_configuration_error(self) -> bool:
+        return self.response_code == "B0115" or self.status_code in (400, 404)
+
+    @property
+    def rate_limit_delay(self) -> float | None:
+        if self.status_code != 429:
+            return None
+        return self.retry_after if self.retry_after is not None else 30.0
+
+    def read_retry_delay(self) -> float | None:
+        if self.is_offline or self.is_auth_error:
+            return None
+        if self.status_code == 429:
+            return self.rate_limit_delay
+        if self.connection_error or self.status_code in (500, 502, 503, 504):
+            return 0.0
+        return None
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if value is None:
+        return None
+    if value.isascii() and value.isdecimal():
+        delay = float(value)
+        return delay if math.isfinite(delay) else None
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except ValueError, OverflowError:
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
 
 
 class SolisCloudControlApiClient:
@@ -42,7 +95,7 @@ class SolisCloudControlApiClient:
     _INVERTER_DETAILS_ENDPOINT = "/v1/api/inverterDetail"
     _TIMEOUT_SECONDS = 30
     _CONCURRENT_REQUESTS = 1
-    _MAX_RETRY_TIME_SECONDS = 30
+    _MAX_RETRY_TIME_SECONDS = 45
 
     _RETRY_POLICY = RetryPolicy(retryable_exception=SolisCloudControlApiError)
 
@@ -53,7 +106,7 @@ class SolisCloudControlApiClient:
         api_token: str,
         session: aiohttp.ClientSession,
         timeout: int = _TIMEOUT_SECONDS,
-        retry_policy: RetryPolicy = _RETRY_POLICY,
+        retry_policy: RetryPolicy[SolisCloudControlApiError] = _RETRY_POLICY,
         concurrent_requests: int = _CONCURRENT_REQUESTS,
     ) -> None:
         self._base_url = base_url
@@ -77,7 +130,7 @@ class SolisCloudControlApiClient:
 
             return data["msg"]
 
-        return await self._retry_policy(read_operation, max_retry_time)
+        return await self._retry_read(read_operation, max_retry_time)
 
     async def read_batch(
         self,
@@ -111,7 +164,7 @@ class SolisCloudControlApiClient:
 
             return result
 
-        return await self._retry_policy(read_batch_operation, max_retry_time)
+        return await self._retry_read(read_batch_operation, max_retry_time)
 
     async def control(
         self,
@@ -119,31 +172,22 @@ class SolisCloudControlApiClient:
         cid: int,
         value: str,
         old_value: str | None = None,
-        max_retry_time: float = _MAX_RETRY_TIME_SECONDS,
     ) -> None:
-        async def control_operation() -> None:
-            payload = {"inverterSn": inverter_sn, "cid": cid, "value": value}
-            if old_value is not None:
-                payload["yuanzhi"] = old_value
+        payload = {"inverterSn": inverter_sn, "cid": cid, "value": value}
+        if old_value is not None:
+            payload["yuanzhi"] = old_value
 
-            data_array = await self._execute_request(self._CONTROL_ENDPOINT, payload)
+        data_array = await self._execute_request(self._CONTROL_ENDPOINT, payload)
+        if data_array is None:
+            raise SolisCloudControlApiError("Control failed: missing 'data' field")
+        if not isinstance(data_array, list):
+            raise SolisCloudControlApiError("Control failed: 'data' field is not an array")
 
-            if data_array is None:
-                raise SolisCloudControlApiError("Control failed: missing 'data' field")
-
-            if not isinstance(data_array, list):
-                raise SolisCloudControlApiError("Control failed: 'data' field is not an array")
-
-            for data in data_array:
-                code = data.get("code")
-
-                if code is not None and str(code) != "0":
-                    error_msg = data.get("msg", "Unknown error")
-                    raise SolisCloudControlApiError(f"Control failed: {error_msg}", response_code=str(code))
-
-            return
-
-        return await self._retry_policy(control_operation, max_retry_time)
+        for data in data_array:
+            code = data.get("code")
+            if code is not None and str(code) != "0":
+                error_msg = data.get("msg", "Unknown error")
+                raise SolisCloudControlApiError(f"Control failed: {error_msg}", response_code=str(code))
 
     async def inverter_list(
         self,
@@ -164,7 +208,7 @@ class SolisCloudControlApiClient:
 
             return data["page"]["records"]
 
-        return await self._retry_policy(inverter_list_operation, max_retry_time)
+        return await self._retry_read(inverter_list_operation, max_retry_time)
 
     async def inverter_details(
         self,
@@ -180,7 +224,20 @@ class SolisCloudControlApiClient:
 
             return data
 
-        return await self._retry_policy(inverter_details_operation, max_retry_time)
+        return await self._retry_read(inverter_details_operation, max_retry_time)
+
+    async def _retry_read[ResultT](self, operation: Callable[[], Awaitable[ResultT]], max_retry_time: float) -> ResultT:
+        if max_retry_time <= 0:
+            return await operation()
+        try:
+            async with asyncio.timeout(max_retry_time):
+                return await self._retry_policy(
+                    operation, max_retry_time, retry_delay=SolisCloudControlApiError.read_retry_delay
+                )
+        except TimeoutError as err:
+            raise SolisCloudControlApiError(
+                "SolisCloud read exceeded its retry deadline", connection_error=True
+            ) from err
 
     async def _execute_request(self, endpoint: str, payload: dict | None = None) -> Any:  # noqa: ANN401
         body = json.dumps(payload)
@@ -211,10 +268,18 @@ class SolisCloudControlApiClient:
         try:
             async with asyncio.timeout(self._timeout):
                 async with self._request_semaphore:
-                    async with self._session.post(url, headers=headers, json=payload) as response:
+                    async with self._session.post(
+                        url, headers=headers, json=payload, allow_redirects=endpoint != self._CONTROL_ENDPOINT
+                    ) as response:
                         if response.status != 200:
                             error_text = await response.text()
-                            raise SolisCloudControlApiError(error_text, status_code=response.status)
+                            raise SolisCloudControlApiError(
+                                error_text,
+                                status_code=response.status,
+                                retry_after=_parse_retry_after(response.headers.get("Retry-After"))
+                                if response.status == 429
+                                else None,
+                            )
 
                         response_json = await response.json()
 
@@ -223,10 +288,14 @@ class SolisCloudControlApiClient:
                         code = response_json.get("code", "Unknown code")
                         if str(code) != "0":
                             error_msg = response_json.get("msg", "Unknown error")
-                            raise SolisCloudControlApiError(f"API operation failed: {error_msg}", response_code=code)
+                            raise SolisCloudControlApiError(
+                                f"API operation failed: {error_msg}", response_code=str(code)
+                            )
 
                         return response_json.get("data")
         except TimeoutError as err:
-            raise SolisCloudControlApiError(f"Timeout accessing {url}") from err
+            raise SolisCloudControlApiError(f"Timeout accessing {url}", connection_error=True) from err
         except aiohttp.ClientError as err:
-            raise SolisCloudControlApiError(f"Error accessing {url}: {str(err)}") from err
+            raise SolisCloudControlApiError(
+                f"Error accessing {url}: {err}", connection_error=isinstance(err, aiohttp.ClientConnectionError)
+            ) from err

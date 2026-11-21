@@ -79,8 +79,7 @@ async def test_create_inverter_info(mock_api_client: AsyncMock) -> None:
 
 @pytest.mark.asyncio
 async def test_create_inverter_info_missing_fields(mock_api_client: AsyncMock) -> None:
-    mock_api_client.inverter_details.return_value = {}
-    mock_api_client.read.return_value = None
+    mock_api_client.inverter_details.return_value = {"energyStorageControl": "0"}
     inverter_sn = "any serial number"
 
     result = await create_inverter_info(mock_api_client, inverter_sn)
@@ -89,13 +88,24 @@ async def test_create_inverter_info_missing_fields(mock_api_client: AsyncMock) -
     assert result.model is None
     assert result.version is None
     assert result.machine is None
-    assert result.energy_storage_control is None
+    assert result.energy_storage_control == "0"
     assert result.smart_support is None
     assert result.generator_support is None
     assert result.collector_model is None
     assert result.power is None
     assert result.power_unit is None
     assert result.tou_v2_mode is None
+
+
+@pytest.mark.parametrize(
+    ("details", "error"),
+    [({}, "energyStorageControl"), ({"energyStorageControl": "1"}, "TOU mode")],
+)
+async def test_missing_capabilities_are_rejected(mock_api_client: AsyncMock, details: dict, error: str) -> None:
+    mock_api_client.inverter_details.return_value = details
+    mock_api_client.read.return_value = None
+    with pytest.raises(SolisCloudControlApiError, match=error):
+        await create_inverter_info(mock_api_client, "sn")
 
 
 @pytest.mark.asyncio

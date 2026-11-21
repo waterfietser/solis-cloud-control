@@ -329,9 +329,11 @@ class TestBatteryCurrentV2:
     @pytest.mark.parametrize(
         ("value", "expected_str"),
         [
+            (0, "0"),
             (0.1, "0"),
             (50.4, "50"),
             (99.9, "100"),
+            (110, "110"),
         ],
     )
     async def test_async_set_value_charge_current(
